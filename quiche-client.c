@@ -50,6 +50,8 @@
 
 #define MAX_DATAGRAM_SIZE 1350
 
+#define NUMBER_SOCKETS 2
+
 typedef struct response_part{
     uint8_t *data;
     ssize_t len;
@@ -81,7 +83,9 @@ struct conn_io {
     int *sockets;
     struct sockaddr_storage *local_addr;
     socklen_t *local_addr_len;
-    int curr_socket;
+
+    struct sockaddr *peer;
+    socklen_t peer_len;
 
     const char *host;
     const char *path;
@@ -229,42 +233,134 @@ static void debug_log(const char *line, void *argp) {
 }
 
 static void handle_path_events(struct conn_io *conn){
+    quiche_path_event *e;
+
+    struct sockaddr_storage local;
+    socklen_t local_len = sizeof(local);
+    struct sockaddr_storage peer;
+    socklen_t peer_len = sizeof(peer);
+
+    while ((e = quiche_conn_path_event_next(conn->conn))){
+        enum quiche_path_event_type type = quiche_path_event_type(e);
+        switch (type)
+        {
+            case QUICHE_PATH_EVENT_VALIDATED:
+                fprintf(stderr, "path validated");
+                break;
+            case QUICHE_PATH_EVENT_FAILED_VALIDATION:
+                fprintf(stderr, "path failed validation");
+                break;
+            case QUICHE_PATH_EVENT_CLOSED:
+                fprintf(stderr, "path closed");
+                break;
+            case QUICHE_PATH_EVENT_REUSED_SOURCE_CONNECTION_ID:
+                fprintf(stderr, "reused connection id");
+                break;
+            default:
+                break;
+        }
+    }
 }
 
-static void flush_egress(struct ev_loop *loop, struct conn_io *conn_io, int idx) {
+static void probe_paths(struct conn_io *conn){
+    uint64_t seq = 0;
+    for (size_t i = 0; i < NUMBER_SOCKETS; i++)
+    {
+        struct sockaddr *local = (struct sockaddr *)&conn->local_addr[i];
+        socklen_t local_len = conn->local_addr_len[i];
+        struct sockaddr *peer = conn->peer;
+        socklen_t peer_len = conn->peer_len;
+        if (quiche_conn_is_path_validated(conn->conn, local, local_len, peer, peer_len) == QUICHE_ERR_INVALID_STATE 
+            && quiche_conn_available_dcids(conn->conn) > 1)
+        {
+            quiche_conn_probe_path(conn->conn, local, local_len, peer, peer_len, &seq);
+        }
+    }
+    
+}
+
+static void schedule(struct conn_io *conn){
+}
+
+static int provide_cids(struct conn_io *conn){
+    if (quiche_conn_scids_left(conn->conn) < NUMBER_SOCKETS)
+        return -1;
+
+    ssize_t rand_len;
+    int rng = open("/dev/urandom", O_RDONLY);
+    if (rng < 0)
+        return -2;
+
+    for (size_t i = 0; i < NUMBER_SOCKETS; i++)
+    {
+        uint64_t seq;
+        uint8_t scid[LOCAL_CONN_ID_LEN];
+        rand_len = read(rng, &scid, sizeof(scid));
+        if (rand_len < 0)
+            return -3;
+        
+        uint8_t reset[16];
+        rand_len = read(rng, &reset, sizeof(reset));
+        if (rand_len < 0)
+            return -4;
+        
+        quiche_conn_new_scid(conn->conn, scid, LOCAL_CONN_ID_LEN, reset, false, &seq);
+    }
+    
+    close(rng);
+    return 0;
+}
+
+static void flush_egress(struct ev_loop *loop, struct conn_io *conn_io) {
     static uint8_t out[MAX_DATAGRAM_SIZE];
 
     quiche_send_info send_info;
 
-    while (1) {
-        ssize_t written = quiche_conn_send(conn_io->conn, out, sizeof(out),
-                                           &send_info);
+    for (size_t i = 0; i < NUMBER_SOCKETS; i++)
+    {
+        int sock = conn_io->sockets[i];
 
-        if (written == QUICHE_ERR_DONE) {
-            fprintf(stderr, "done writing\n");
-            break;
+        struct sockaddr_storage *from = &conn_io->local_addr[i];
+        socklen_t len = conn_io->local_addr_len[i];
+
+        quiche_socket_addr_iter *iter = quiche_conn_paths_iter(conn_io->conn, (struct sockaddr *) from, len);
+
+        struct sockaddr_storage peer;
+        socklen_t len_peer = sizeof(peer);
+
+        while(quiche_socket_addr_iter_next(iter, &peer, (size_t *) &len_peer)){
+            while (1) {
+                ssize_t written = quiche_conn_send_on_path(conn_io->conn, 
+                                                           out, sizeof(out), (struct sockaddr *) from, len, 
+                                                           (struct sockaddr *) &peer, len_peer, &send_info);
+
+                if (written == QUICHE_ERR_DONE) {
+                    fprintf(stderr, "done writing\n");
+                    break;
+                }
+
+                if (written < 0) {
+                    fprintf(stderr, "failed to create packet: %zd\n", written);
+                    return;
+                }
+
+                ssize_t sent = sendto(sock, out, written, 0,
+                                    (struct sockaddr *) &send_info.to,
+                                    send_info.to_len);
+
+                if (sent != written) {
+                    perror("failed to send");
+                    return;
+                }
+
+                fprintf(stderr, "sent %zd bytes\n", sent);
+            }
+
+            double t = quiche_conn_timeout_as_nanos(conn_io->conn) / 1e9f;
+            conn_io->timer.repeat = t;
+            ev_timer_again(loop, &conn_io->timer);
         }
-
-        if (written < 0) {
-            fprintf(stderr, "failed to create packet: %zd\n", written);
-            return;
-        }
-
-        ssize_t sent = sendto(conn_io->sockets[idx], out, written, 0,
-                              (struct sockaddr *) &send_info.to,
-                              send_info.to_len);
-
-        if (sent != written) {
-            perror("failed to send");
-            return;
-        }
-
-        fprintf(stderr, "sent %zd bytes\n", sent);
     }
-
-    double t = quiche_conn_timeout_as_nanos(conn_io->conn) / 1e9f;
-    conn_io->timer.repeat = t;
-    ev_timer_again(loop, &conn_io->timer);
 }
 
 static int for_each_setting(uint64_t identifier, uint64_t value,
@@ -337,9 +433,17 @@ static void recv_cb(EV_P_ ev_io *w, int revents) {
         return;
     }
 
+    if (quiche_conn_is_established(conn_io->conn)){
+        probe_paths(conn_io);
+        handle_path_events(conn_io);
+        schedule(conn_io);
+    }
+
     if (quiche_conn_is_established(conn_io->conn) && !conn_io->req_sent) {
         const uint8_t *app_proto;
         size_t app_proto_len;
+
+        provide_cids(conn_io);
 
         quiche_conn_application_proto(conn_io->conn, &app_proto, &app_proto_len);
 
@@ -491,7 +595,7 @@ static void recv_cb(EV_P_ ev_io *w, int revents) {
         }
     }
 
-    flush_egress(loop, conn_io, sock_state->idx);
+    flush_egress(loop, conn_io);
 }
 
 static void timeout_cb(EV_P_ ev_timer *w, int revents) {
@@ -500,7 +604,7 @@ static void timeout_cb(EV_P_ ev_timer *w, int revents) {
 
     fprintf(stderr, "timeout\n");
 
-    flush_egress(loop, conn_io, conn_io->curr_socket);
+    flush_egress(loop, conn_io);
 
     if (quiche_conn_is_closed(conn_io->conn)) {
         quiche_stats stats;
@@ -572,7 +676,6 @@ int get_sockets(int family, int number_sockets, struct conn_io *conn_io){
 }
 
 http_response_t *quiche_fetch(const char *host, const char *port, const char *path){
-    int number_sockets = 2;
 
     const struct addrinfo hints = {
         .ai_family = PF_UNSPEC,
@@ -634,7 +737,7 @@ http_response_t *quiche_fetch(const char *host, const char *port, const char *pa
         return new_response(-1, (uint8_t *) msg, strlen(msg));
     }
 
-    get_sockets(peer->ai_family, number_sockets, conn_io);
+    get_sockets(peer->ai_family, NUMBER_SOCKETS, conn_io);
     
     print_ip_addr((struct sockaddr *) &conn_io->local_addr[0]);
 
@@ -642,6 +745,10 @@ http_response_t *quiche_fetch(const char *host, const char *port, const char *pa
                                        (struct sockaddr *) &conn_io->local_addr[0],
                                        conn_io->local_addr_len[0],
                                        peer->ai_addr, peer->ai_addrlen, config);
+
+    if (getenv("SSLKEYLOGFILE")) {
+        quiche_conn_set_keylog_path(conn, getenv("SSLKEYLOGFILE"));
+    }
 
     if (conn == NULL) {
         char *msg = "failed to create connection";
@@ -655,16 +762,18 @@ http_response_t *quiche_fetch(const char *host, const char *port, const char *pa
     conn_io->req_sent = false;
     conn_io->settings_received = false;
     conn_io->failed_malloc = 0;
+    conn_io->peer = peer->ai_addr;
+    conn_io->peer_len = peer->ai_addrlen;
     conn_io->response.head = NULL;
     conn_io->response.tail = NULL;
     conn_io->response.total_len = 0;
 
-    ev_io watchers[number_sockets];
+    ev_io watchers[NUMBER_SOCKETS];
 
     struct ev_loop *loop = ev_default_loop(0);
 
-    socket_state_t *sock_states = malloc(sizeof(socket_state_t) * number_sockets);
-    for (size_t i = 0; i < number_sockets; i++)
+    socket_state_t *sock_states = malloc(sizeof(socket_state_t) * NUMBER_SOCKETS);
+    for (size_t i = 0; i < NUMBER_SOCKETS; i++)
     {
         socket_state_t *sock_state = &sock_states[i];
         sock_state->conn = conn_io;
@@ -679,7 +788,7 @@ http_response_t *quiche_fetch(const char *host, const char *port, const char *pa
     ev_init(&conn_io->timer, timeout_cb);
     conn_io->timer.data = conn_io;
 
-    flush_egress(loop, conn_io, 0);
+    flush_egress(loop, conn_io);
 
     ev_loop(loop, 0);
 

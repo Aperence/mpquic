@@ -1,8 +1,15 @@
-INCLUDES=-Iquiche/quiche/include -I/usr/local/include
+INCLUDES=-Iquiche/quiche/include -I/usr/local/include -Iuthash/include
 LIBS=quiche/target/release/libquiche.a -lev -ldl -pthread -lm
 
-main: quiche-client.c
-	gcc -o main $< $(LIBS) $(INCLUDES) -g
+all: client server
+
+server: quiche-server.c dependencies
+	gcc -o server $< $(LIBS) $(INCLUDES) -g
+
+client: quiche-client.c dependencies
+	gcc -o client $< $(LIBS) $(INCLUDES) -g
+
+dependencies: quiche libev uthash
 
 quiche:
 	git clone https://github.com/cloudflare/quiche.git
@@ -21,3 +28,12 @@ libev:
 		./configure && \
 		make && \
 		sudo make install
+
+uthash:
+	curl -LO https://github.com/troydhanson/uthash/archive/refs/tags/v2.3.0.tar.gz
+	tar -xvf v2.3.0.tar.gz
+	mv uthash-2.3.0 uthash
+
+clean:
+	rm client
+	rm server
