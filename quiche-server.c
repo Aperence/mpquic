@@ -75,6 +75,9 @@ struct conn_io {
     socklen_t peer_addr_len;
 
     UT_hash_handle hh;
+
+    int file;
+    int stream;
 };
 
 static quiche_config *config = NULL;
@@ -87,6 +90,70 @@ static void timeout_cb(EV_P_ ev_timer *w, int revents);
 
 static void debug_log(const char *line, void *argp) {
     fprintf(stderr, "%s\n", line);
+}
+
+static void handle_path_events(struct conn_io *conn){
+    uint64_t seq;
+    quiche_path_event *e;
+
+    struct sockaddr_storage local;
+    socklen_t local_len = sizeof(local);
+    struct sockaddr_storage peer;
+    socklen_t peer_len = sizeof(peer);
+
+    while ((e = quiche_conn_path_event_next(conn->conn))){
+        enum quiche_path_event_type type = quiche_path_event_type(e);
+        switch (type)
+        {
+            case QUICHE_PATH_EVENT_NEW:
+                fprintf(stderr, "new path");
+                quiche_path_event_new(e, &local, &local_len, &peer, &peer_len);
+                quiche_conn_probe_path(conn->conn, (struct sockaddr *) &local, 
+                                       local_len, (struct sockaddr *) &peer, 
+                                       peer_len, &seq);
+                break;
+            case QUICHE_PATH_EVENT_VALIDATED:
+                fprintf(stderr, "path validated");
+                break;
+            case QUICHE_PATH_EVENT_FAILED_VALIDATION:
+                fprintf(stderr, "path failed validation");
+                break;
+            case QUICHE_PATH_EVENT_CLOSED:
+                fprintf(stderr, "path closed");
+                break;
+            case QUICHE_PATH_EVENT_REUSED_SOURCE_CONNECTION_ID:
+                fprintf(stderr, "reused connection id");
+                break;
+            default:
+                break;
+        }
+    }
+}
+
+static int provide_cids(struct conn_io *conn){
+    ssize_t rand_len;
+    int rng = open("/dev/urandom", O_RDONLY);
+    if (rng < 0)
+        return -2;
+
+    while (quiche_conn_scids_left(conn->conn) > 0)
+    {
+        uint64_t seq;
+        uint8_t scid[LOCAL_CONN_ID_LEN];
+        rand_len = read(rng, &scid, sizeof(scid));
+        if (rand_len < 0)
+            return -3;
+        
+        uint8_t reset[16];
+        rand_len = read(rng, &reset, sizeof(reset));
+        if (rand_len < 0)
+            return -4;
+        
+        quiche_conn_new_scid(conn->conn, scid, LOCAL_CONN_ID_LEN, reset, false, &seq);
+    }
+    
+    close(rng);
+    return 0;
 }
 
 static void flush_egress(struct ev_loop *loop, struct conn_io *conn_io) {
@@ -219,6 +286,8 @@ static struct conn_io *create_conn(uint8_t *scid, size_t scid_len,
     ev_init(&conn_io->timer, timeout_cb);
     conn_io->timer.data = conn_io;
 
+    conn_io->file = -1;
+
     HASH_ADD(hh, conns->h, cid, LOCAL_CONN_ID_LEN, conn_io);
 
     fprintf(stderr, "new connection\n");
@@ -232,6 +301,15 @@ static int for_each_header(uint8_t *name, size_t name_len,
     fprintf(stderr, "got HTTP header: %.*s=%.*s\n",
             (int) name_len, name, (int) value_len, value);
 
+    if (strncmp(name, ":path", name_len) == 0){
+        char *path = argp;
+        char temp[value_len+1];
+        memcpy(temp, value, value_len);
+        temp[value_len] = '\0';
+        // transform the path in our local path (data/*)
+        int written = sprintf(path, "data%s", temp);
+        path[written] = 0;
+    }
     return 0;
 }
 
@@ -239,6 +317,7 @@ static void recv_cb(EV_P_ ev_io *w, int revents) {
     struct conn_io *tmp, *conn_io = NULL;
 
     static uint8_t buf[65535];
+    static uint8_t file_buf[65535];
     static uint8_t out[MAX_DATAGRAM_SIZE];
 
     while (1) {
@@ -246,11 +325,11 @@ static void recv_cb(EV_P_ ev_io *w, int revents) {
         socklen_t peer_addr_len = sizeof(peer_addr);
         memset(&peer_addr, 0, peer_addr_len);
 
-        ssize_t read = recvfrom(conns->sock, buf, sizeof(buf), 0,
+        ssize_t readed = recvfrom(conns->sock, buf, sizeof(buf), 0,
                                 (struct sockaddr *) &peer_addr,
                                 &peer_addr_len);
 
-        if (read < 0) {
+        if (readed < 0) {
             if ((errno == EWOULDBLOCK) || (errno == EAGAIN)) {
                 fprintf(stderr, "recv would block\n");
                 break;
@@ -275,7 +354,7 @@ static void recv_cb(EV_P_ ev_io *w, int revents) {
         uint8_t token[MAX_TOKEN_LEN];
         size_t token_len = sizeof(token);
 
-        int rc = quiche_header_info(buf, read, LOCAL_CONN_ID_LEN, &version,
+        int rc = quiche_header_info(buf, readed, LOCAL_CONN_ID_LEN, &version,
                                     &type, scid, &scid_len, dcid, &dcid_len,
                                     token, &token_len);
         if (rc < 0) {
@@ -371,7 +450,7 @@ static void recv_cb(EV_P_ ev_io *w, int revents) {
             conns->local_addr_len,
         };
 
-        ssize_t done = quiche_conn_recv(conn_io->conn, buf, read, &recv_info);
+        ssize_t done = quiche_conn_recv(conn_io->conn, buf, readed, &recv_info);
 
         if (done < 0) {
             fprintf(stderr, "failed to process packet: %zd\n", done);
@@ -381,6 +460,10 @@ static void recv_cb(EV_P_ ev_io *w, int revents) {
         fprintf(stderr, "recv %zd bytes\n", done);
 
         if (quiche_conn_is_established(conn_io->conn)) {
+
+            provide_cids(conn_io);
+            handle_path_events(conn_io);
+
             quiche_h3_event *ev;
 
             if (conn_io->http3 == NULL) {
@@ -392,7 +475,15 @@ static void recv_cb(EV_P_ ev_io *w, int revents) {
                 }
             }
 
+            if (conn_io->file >= 0){
+                
+                int size = read(conn_io->file, file_buf, 65535);
+                quiche_h3_send_body(conn_io->http3, conn_io->conn,
+                                                    conn_io->stream, file_buf, size, size == 0);
+            }
+
             while (1) {
+                char path[1024];
                 int64_t s = quiche_h3_conn_poll(conn_io->http3,
                                                 conn_io->conn,
                                                 &ev);
@@ -405,42 +496,74 @@ static void recv_cb(EV_P_ ev_io *w, int revents) {
                     case QUICHE_H3_EVENT_HEADERS: {
                         int rc = quiche_h3_event_for_each_header(ev,
                                                                  for_each_header,
-                                                                 NULL);
+                                                                 path);
                         if (rc != 0) {
                             fprintf(stderr, "failed to process headers\n");
                         }
 
-                        quiche_h3_header headers[] = {
-                            {
-                                .name = (const uint8_t *) ":status",
-                                .name_len = sizeof(":status") - 1,
+                        printf("%s\n", path);
 
-                                .value = (const uint8_t *) "200",
-                                .value_len = sizeof("200") - 1,
-                            },
+                        int file = open(path, O_RDONLY);
+                        if (file < 0){
+                            quiche_h3_header headers[] = {
+                                {
+                                    .name = (const uint8_t *) ":status",
+                                    .name_len = sizeof(":status") - 1,
 
-                            {
-                                .name = (const uint8_t *) "server",
-                                .name_len = sizeof("server") - 1,
+                                    .value = (const uint8_t *) "404",
+                                    .value_len = sizeof("404") - 1,
+                                },
 
-                                .value = (const uint8_t *) "quiche",
-                                .value_len = sizeof("quiche") - 1,
-                            },
+                                {
+                                    .name = (const uint8_t *) "server",
+                                    .name_len = sizeof("server") - 1,
 
-                            {
-                                .name = (const uint8_t *) "content-length",
-                                .name_len = sizeof("content-length") - 1,
+                                    .value = (const uint8_t *) "quiche",
+                                    .value_len = sizeof("quiche") - 1,
+                                },
+                            };
 
-                                .value = (const uint8_t *) "5",
-                                .value_len = sizeof("5") - 1,
-                            },
-                        };
+                            quiche_h3_send_response(conn_io->http3, conn_io->conn,
+                                                    s, headers, 3, true);
+                        }else{
+                            uint8_t content_length[256];
 
-                        quiche_h3_send_response(conn_io->http3, conn_io->conn,
-                                                s, headers, 3, false);
+                            struct stat st;
+                            fstat(file, &st);
+                            int size = sprintf(content_length, "%d", st.st_size);
 
-                        quiche_h3_send_body(conn_io->http3, conn_io->conn,
-                                            s, (uint8_t *) "byez\n", 5, true);
+                            quiche_h3_header headers[] = {
+                                {
+                                    .name = (const uint8_t *) ":status",
+                                    .name_len = sizeof(":status") - 1,
+
+                                    .value = (const uint8_t *) "200",
+                                    .value_len = sizeof("200") - 1,
+                                },
+
+                                {
+                                    .name = (const uint8_t *) "server",
+                                    .name_len = sizeof("server") - 1,
+
+                                    .value = (const uint8_t *) "quiche",
+                                    .value_len = sizeof("quiche") - 1,
+                                },
+
+                                {
+                                    .name = (const uint8_t *) "content-length",
+                                    .name_len = sizeof("content-length") - 1,
+
+                                    .value = (const uint8_t *) content_length,
+                                    .value_len = size,
+                                },
+                            };
+
+                            quiche_h3_send_response(conn_io->http3, conn_io->conn,
+                                                    s, headers, 3, false);
+
+                            conn_io->file = file;
+                            conn_io->stream = s;
+                        }
                         break;
                     }
 
@@ -576,8 +699,9 @@ int main(int argc, char *argv[]) {
     quiche_config_set_initial_max_stream_data_uni(config, 1000000);
     quiche_config_set_initial_max_streams_bidi(config, 100);
     quiche_config_set_initial_max_streams_uni(config, 100);
-    quiche_config_set_disable_active_migration(config, true);
+    // quiche_config_set_disable_active_migration(config, true);
     quiche_config_set_cc_algorithm(config, QUICHE_CC_RENO);
+    quiche_config_set_active_connection_id_limit(config, 10);
 
     http3_config = quiche_h3_config_new();
     if (http3_config == NULL) {

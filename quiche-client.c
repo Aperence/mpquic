@@ -52,6 +52,10 @@
 
 #define NUMBER_SOCKETS 2
 
+typedef enum fetch_error{
+    MALLOC_ERROR = -128
+}fetch_error_t;
+
 typedef struct response_part{
     uint8_t *data;
     ssize_t len;
@@ -99,7 +103,7 @@ struct conn_io {
 
     response_t response;
     
-    int failed_malloc;
+    fetch_error_t error;
 };
 
 int add_response_part(struct conn_io *conn, uint8_t *data, ssize_t len){
@@ -157,6 +161,7 @@ http_response_t *new_response(int status, uint8_t *res, ssize_t len){
 
 static void print_ip_addr(struct sockaddr *addr){
     char s[INET6_ADDRSTRLEN > INET_ADDRSTRLEN ? INET6_ADDRSTRLEN : INET_ADDRSTRLEN];
+    int port;
 
     switch(addr->sa_family) {
         case AF_INET: {
@@ -166,6 +171,7 @@ static void print_ip_addr(struct sockaddr *addr){
                 // this is large enough to include terminating null
 
             inet_ntop(AF_INET, &(addr_in->sin_addr), s, INET_ADDRSTRLEN);
+            port = addr_in->sin_port;
             break;
         }
         case AF_INET6: {
@@ -175,12 +181,13 @@ static void print_ip_addr(struct sockaddr *addr){
                 // not sure if large enough to include terminating null?
 
             inet_ntop(AF_INET6, &(addr_in6->sin6_addr), s, INET6_ADDRSTRLEN);
+            port = addr_in6->sin6_port;
             break;
         }
         default:
             break;
     }
-    printf("IP address: %s\n", s);
+    fprintf(stderr, "IP address: [%s]:%d\n", s, port);
 }
 
 ip_addr_itf_t *get_addrs(int family){
@@ -266,14 +273,17 @@ static void probe_paths(struct conn_io *conn){
     uint64_t seq = 0;
     for (size_t i = 0; i < NUMBER_SOCKETS; i++)
     {
-        struct sockaddr *local = (struct sockaddr *)&conn->local_addr[i];
+        struct sockaddr *local = (struct sockaddr *) &conn->local_addr[i];
         socklen_t local_len = conn->local_addr_len[i];
         struct sockaddr *peer = conn->peer;
         socklen_t peer_len = conn->peer_len;
+        print_ip_addr(local);
         if (quiche_conn_is_path_validated(conn->conn, local, local_len, peer, peer_len) == QUICHE_ERR_INVALID_STATE 
-            && quiche_conn_available_dcids(conn->conn) > 1)
+            && quiche_conn_available_dcids(conn->conn) > 0)
         {
-            quiche_conn_probe_path(conn->conn, local, local_len, peer, peer_len, &seq);
+            fprintf(stderr, "probing path\n");
+            int s = quiche_conn_probe_path(conn->conn, local, local_len, peer, peer_len, &seq);
+            fprintf(stderr, "Return of probe %d\n", s);
         }
     }
     
@@ -434,6 +444,7 @@ static void recv_cb(EV_P_ ev_io *w, int revents) {
     }
 
     if (quiche_conn_is_established(conn_io->conn)){
+        provide_cids(conn_io);
         probe_paths(conn_io);
         handle_path_events(conn_io);
         schedule(conn_io);
@@ -560,7 +571,7 @@ static void recv_cb(EV_P_ ev_io *w, int revents) {
                         }
 
                         if (add_response_part(conn_io, buf, len) == -1){
-                            conn_io->failed_malloc = 1;
+                            conn_io->error = MALLOC_ERROR;
                             ev_break(EV_A_ EVBREAK_ONE);
                         }
                     }
@@ -661,6 +672,27 @@ int get_sockets(int family, int number_sockets, struct conn_io *conn_io){
             return -2;
         }
 
+        struct sockaddr_storage addr;
+        socklen_t len = sizeof(addr);
+
+        if (family == AF_INET){
+            struct sockaddr_in *addr_in = (struct sockaddr_in *) &addr;
+            addr_in->sin_family = AF_INET;
+            addr_in->sin_addr.s_addr = INADDR_ANY;
+            addr_in->sin_port=htons(9000 + i);
+        }else{
+            struct sockaddr_in6 *addr_in6 = (struct sockaddr_in6 *) &addr;
+            addr_in6->sin6_family = AF_INET6;
+            addr_in6->sin6_addr = in6addr_any;
+            addr_in6->sin6_port=htons(9000 + i);
+        }
+
+
+        if (bind(sock, (struct sockaddr *) &addr, len)){
+            fprintf(stderr, "Failed to bind socket");
+            return -3;
+        }
+
         conn_io->sockets[i] = sock;
 
         conn_io->local_addr_len[i] = sizeof(struct sockaddr_storage);
@@ -710,7 +742,8 @@ http_response_t *quiche_fetch(const char *host, const char *port, const char *pa
     quiche_config_set_initial_max_stream_data_uni(config, 1000000);
     quiche_config_set_initial_max_streams_bidi(config, 100);
     quiche_config_set_initial_max_streams_uni(config, 100);
-    quiche_config_set_disable_active_migration(config, true);
+    quiche_config_set_active_connection_id_limit(config, 10);
+    //quiche_config_set_disable_active_migration(config, true);
 
     if (getenv("SSLKEYLOGFILE")) {
       quiche_config_log_keys(config);
@@ -761,7 +794,7 @@ http_response_t *quiche_fetch(const char *host, const char *port, const char *pa
     conn_io->path = path;
     conn_io->req_sent = false;
     conn_io->settings_received = false;
-    conn_io->failed_malloc = 0;
+    conn_io->error = 0;
     conn_io->peer = peer->ai_addr;
     conn_io->peer_len = peer->ai_addrlen;
     conn_io->response.head = NULL;
@@ -806,10 +839,11 @@ http_response_t *quiche_fetch(const char *host, const char *port, const char *pa
         return new_response(-2, (uint8_t *) msg, strlen(msg));
     }
     
-    if (conn_io->failed_malloc){
-        char *msg = "failed to allocate memory for response";
+    if (conn_io->error){
+        char msg[256];
+        sprintf(msg, "Error during request: %d", conn_io->error);
         free_responses(conn_io->response);
-        return new_response(-3, (uint8_t *) msg, strlen(msg));
+        return new_response(conn_io->error, (uint8_t *) msg, strlen(msg));
     }
 
     uint8_t *out_res = construct_full_response(conn_io->response);
@@ -827,9 +861,10 @@ http_response_t *quiche_fetch(const char *host, const char *port, const char *pa
 
 int main(int argc, char const *argv[])
 {
-    http_response_t *res = quiche_fetch(argv[1], argv[2], "/");
+    http_response_t *res = quiche_fetch(argv[1], argv[2], argv[3]);
 
-    int fd = open("out.html", O_WRONLY | O_CREAT, 0666);
+    int fd = open("out.html", O_WRONLY | O_CREAT | O_TRUNC, 0666);
+
     write(fd, res->data, res->len);
     close(fd);
 
