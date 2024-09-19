@@ -81,12 +81,17 @@ typedef struct socket_state{
     struct conn_io *conn;
 }socket_state_t;
 
+typedef struct schedule_state{
+    int idx;
+}schedule_state_t;
+
 struct conn_io {
     ev_timer timer;
 
     int *sockets;
     struct sockaddr_storage *local_addr;
     socklen_t *local_addr_len;
+    int number_sockets;
 
     struct sockaddr *peer;
     socklen_t peer_len;
@@ -104,6 +109,8 @@ struct conn_io {
     response_t response;
     
     fetch_error_t error;
+
+    schedule_state_t schedule_data;
 };
 
 int add_response_part(struct conn_io *conn, uint8_t *data, ssize_t len){
@@ -159,8 +166,9 @@ http_response_t *new_response(int status, uint8_t *res, ssize_t len){
     return response;
 }
 
-static void print_ip_addr(struct sockaddr *addr){
-    char s[INET6_ADDRSTRLEN > INET_ADDRSTRLEN ? INET6_ADDRSTRLEN : INET_ADDRSTRLEN];
+static char *ip2str(struct sockaddr *addr){
+    int ip_len = INET6_ADDRSTRLEN > INET_ADDRSTRLEN ? INET6_ADDRSTRLEN : INET_ADDRSTRLEN;
+    char s[ip_len];
     int port;
 
     switch(addr->sa_family) {
@@ -187,7 +195,9 @@ static void print_ip_addr(struct sockaddr *addr){
         default:
             break;
     }
-    fprintf(stderr, "IP address: [%s]:%d\n", s, port);
+    char *ret = malloc(ip_len + 10);
+    sprintf(ret, "[%s]:%d", s, ntohs(port));
+    return ret;
 }
 
 ip_addr_itf_t *get_addrs(int family){
@@ -239,6 +249,14 @@ static void debug_log(const char *line, void *argp) {
     fprintf(stderr, "%s\n", line);
 }
 
+static void print_path(const char *msg, struct sockaddr *local, struct sockaddr *peer) {
+    char *ip_local = ip2str(local);
+    char *ip_peer = ip2str(peer);
+    fprintf(stderr, "Path %s -> %s: %s\n", ip_local, ip_peer, msg);
+    free(ip_local);
+    free(ip_peer);
+}
+
 static void handle_path_events(struct conn_io *conn){
     quiche_path_event *e;
 
@@ -251,6 +269,8 @@ static void handle_path_events(struct conn_io *conn){
         enum quiche_path_event_type type = quiche_path_event_type(e);
         switch (type)
         {
+            case QUICHE_PATH_EVENT_NEW:
+                fprintf(stderr, "new path");
             case QUICHE_PATH_EVENT_VALIDATED:
                 fprintf(stderr, "path validated");
                 break;
@@ -271,17 +291,16 @@ static void handle_path_events(struct conn_io *conn){
 
 static void probe_paths(struct conn_io *conn){
     uint64_t seq = 0;
-    for (size_t i = 0; i < NUMBER_SOCKETS; i++)
+    for (size_t i = 0; i < conn->number_sockets; i++)
     {
         struct sockaddr *local = (struct sockaddr *) &conn->local_addr[i];
         socklen_t local_len = conn->local_addr_len[i];
         struct sockaddr *peer = conn->peer;
         socklen_t peer_len = conn->peer_len;
-        print_ip_addr(local);
         if (quiche_conn_is_path_validated(conn->conn, local, local_len, peer, peer_len) == QUICHE_ERR_INVALID_STATE 
             && quiche_conn_available_dcids(conn->conn) > 0)
         {
-            fprintf(stderr, "probing path\n");
+            print_path("probing", local, peer);
             int s = quiche_conn_probe_path(conn->conn, local, local_len, peer, peer_len, &seq);
             fprintf(stderr, "Return of probe %d\n", s);
         }
@@ -290,18 +309,36 @@ static void probe_paths(struct conn_io *conn){
 }
 
 static void schedule(struct conn_io *conn){
+    // simple round-robin, could use other schedulers in the future.
+    // ex: WRR depending on the delivering rate of the != paths
+    //     or interactive where we select the path with lowest rtt.
+    //     the method quiche_conn_path_stats could be useful for this 
+    uint64_t seq;
+    int next = (conn->schedule_data.idx + 1) % conn->number_sockets;
+    struct sockaddr_storage local;
+    socklen_t local_len;
+    while (1){
+        local = conn->local_addr[next];
+        local_len = conn->local_addr_len[next];
+        if (quiche_conn_is_path_validated(conn->conn,
+                                          (struct sockaddr *) &local, local_len,
+                                          (struct sockaddr *) conn->peer, conn->peer_len) == 1){
+            break;
+        }
+        next = (next + 1) % conn->number_sockets;
+    }
+    conn->schedule_data.idx = next;
+    quiche_conn_migrate_source(conn->conn, (struct sockaddr *) &local, local_len, &seq);
 }
 
 static int provide_cids(struct conn_io *conn){
-    if (quiche_conn_scids_left(conn->conn) < NUMBER_SOCKETS)
-        return -1;
 
     ssize_t rand_len;
     int rng = open("/dev/urandom", O_RDONLY);
     if (rng < 0)
         return -2;
 
-    for (size_t i = 0; i < NUMBER_SOCKETS; i++)
+    while (quiche_conn_scids_left(conn->conn) > 0)
     {
         uint64_t seq;
         uint8_t scid[LOCAL_CONN_ID_LEN];
@@ -326,7 +363,7 @@ static void flush_egress(struct ev_loop *loop, struct conn_io *conn_io) {
 
     quiche_send_info send_info;
 
-    for (size_t i = 0; i < NUMBER_SOCKETS; i++)
+    for (size_t i = 0; i < conn_io->number_sockets; i++)
     {
         int sock = conn_io->sockets[i];
 
@@ -339,6 +376,8 @@ static void flush_egress(struct ev_loop *loop, struct conn_io *conn_io) {
         socklen_t len_peer = sizeof(peer);
 
         while(quiche_socket_addr_iter_next(iter, &peer, (size_t *) &len_peer)){
+            print_path("sending", (struct sockaddr *) from, (struct sockaddr *) &peer);
+
             while (1) {
                 ssize_t written = quiche_conn_send_on_path(conn_io->conn, 
                                                            out, sizeof(out), (struct sockaddr *) from, len, 
@@ -370,6 +409,8 @@ static void flush_egress(struct ev_loop *loop, struct conn_io *conn_io) {
             conn_io->timer.repeat = t;
             ev_timer_again(loop, &conn_io->timer);
         }
+
+        quiche_socket_addr_iter_free(iter);
     }
 }
 
@@ -703,6 +744,8 @@ int get_sockets(int family, int number_sockets, struct conn_io *conn_io){
             return -3;
         }
     }
+
+    conn_io->number_sockets = number_sockets;
     
     return 0;
 }
@@ -743,6 +786,7 @@ http_response_t *quiche_fetch(const char *host, const char *port, const char *pa
     quiche_config_set_initial_max_streams_bidi(config, 100);
     quiche_config_set_initial_max_streams_uni(config, 100);
     quiche_config_set_active_connection_id_limit(config, 10);
+
     //quiche_config_set_disable_active_migration(config, true);
 
     if (getenv("SSLKEYLOGFILE")) {
@@ -771,8 +815,6 @@ http_response_t *quiche_fetch(const char *host, const char *port, const char *pa
     }
 
     get_sockets(peer->ai_family, NUMBER_SOCKETS, conn_io);
-    
-    print_ip_addr((struct sockaddr *) &conn_io->local_addr[0]);
 
     quiche_conn *conn = quiche_connect(host, (const uint8_t *) scid, sizeof(scid),
                                        (struct sockaddr *) &conn_io->local_addr[0],
@@ -800,6 +842,7 @@ http_response_t *quiche_fetch(const char *host, const char *port, const char *pa
     conn_io->response.head = NULL;
     conn_io->response.tail = NULL;
     conn_io->response.total_len = 0;
+    conn_io->schedule_data.idx = 0;
 
     ev_io watchers[NUMBER_SOCKETS];
 

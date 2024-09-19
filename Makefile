@@ -16,7 +16,7 @@ quiche:
 
 	cd quiche && \
 		git submodule update --init && \
-		cargo build --features ffi --release
+		cargo build --features ffi --features qlog --release
 
 libev:
 	curl -O http://dist.schmorp.de/libev/libev-4.33.tar.gz

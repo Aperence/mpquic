@@ -61,6 +61,11 @@ struct connections {
     struct conn_io *h;
 };
 
+typedef struct schedule_state{
+    int idx;
+    int number_paths;
+}schedule_state_t;
+
 struct conn_io {
     ev_timer timer;
 
@@ -71,6 +76,9 @@ struct conn_io {
     quiche_conn *conn;
     quiche_h3_conn *http3;
 
+    struct sockaddr_storage local_addr;
+    socklen_t local_addr_len;
+
     struct sockaddr_storage peer_addr;
     socklen_t peer_addr_len;
 
@@ -78,6 +86,7 @@ struct conn_io {
 
     int file;
     int stream;
+    schedule_state_t schedule_data;
 };
 
 static quiche_config *config = NULL;
@@ -114,6 +123,7 @@ static void handle_path_events(struct conn_io *conn){
                 break;
             case QUICHE_PATH_EVENT_VALIDATED:
                 fprintf(stderr, "path validated");
+                conn->schedule_data.number_paths++;
                 break;
             case QUICHE_PATH_EVENT_FAILED_VALIDATION:
                 fprintf(stderr, "path failed validation");
@@ -154,6 +164,22 @@ static int provide_cids(struct conn_io *conn){
     
     close(rng);
     return 0;
+}
+
+static void schedule(struct conn_io *conn){
+    uint64_t seq;
+    int offset = conn->schedule_data.idx;
+    struct sockaddr_storage peer;
+    socklen_t peer_len;
+    quiche_socket_addr_iter *iter = quiche_conn_paths_iter(conn->conn, (struct sockaddr *) &conn->local_addr, conn->local_addr_len);
+    for (size_t i = 0; i < offset; i++){
+        quiche_socket_addr_iter_next(iter, &peer, (size_t *) &peer_len);
+    }
+    quiche_socket_addr_iter_free(iter);
+    conn->schedule_data.idx = (conn->schedule_data.idx + 1) % conn->schedule_data.number_paths;
+    quiche_conn_migrate(conn->conn, 
+                        (struct sockaddr *) &conn->local_addr, conn->local_addr_len,
+                        (struct sockaddr *) &peer, peer_len, &seq);
 }
 
 static void flush_egress(struct ev_loop *loop, struct conn_io *conn_io) {
@@ -280,6 +306,9 @@ static struct conn_io *create_conn(uint8_t *scid, size_t scid_len,
     conn_io->sock = conns->sock;
     conn_io->conn = conn;
 
+    memcpy(&conn_io->local_addr, local_addr, local_addr_len);
+    conn_io->local_addr_len = local_addr_len;
+
     memcpy(&conn_io->peer_addr, peer_addr, peer_addr_len);
     conn_io->peer_addr_len = peer_addr_len;
 
@@ -287,6 +316,8 @@ static struct conn_io *create_conn(uint8_t *scid, size_t scid_len,
     conn_io->timer.data = conn_io;
 
     conn_io->file = -1;
+    conn_io->schedule_data.idx = 0;
+    conn_io->schedule_data.number_paths = 1;
 
     HASH_ADD(hh, conns->h, cid, LOCAL_CONN_ID_LEN, conn_io);
 
