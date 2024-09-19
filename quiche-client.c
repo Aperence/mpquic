@@ -25,6 +25,7 @@
 // SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #include "quiche-client.h"
+#include "utils.h"
 #include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -166,40 +167,6 @@ http_response_t *new_response(int status, uint8_t *res, ssize_t len){
     return response;
 }
 
-static char *ip2str(struct sockaddr *addr){
-    int ip_len = INET6_ADDRSTRLEN > INET_ADDRSTRLEN ? INET6_ADDRSTRLEN : INET_ADDRSTRLEN;
-    char s[ip_len];
-    int port;
-
-    switch(addr->sa_family) {
-        case AF_INET: {
-            struct sockaddr_in *addr_in = (struct sockaddr_in *) addr;
-
-            ////char s[INET_ADDRSTRLEN] = '\0';
-                // this is large enough to include terminating null
-
-            inet_ntop(AF_INET, &(addr_in->sin_addr), s, INET_ADDRSTRLEN);
-            port = addr_in->sin_port;
-            break;
-        }
-        case AF_INET6: {
-            struct sockaddr_in6 *addr_in6 = (struct sockaddr_in6 *) addr;
-            
-            ////char s[INET6_ADDRSTRLEN] = '\0';
-                // not sure if large enough to include terminating null?
-
-            inet_ntop(AF_INET6, &(addr_in6->sin6_addr), s, INET6_ADDRSTRLEN);
-            port = addr_in6->sin6_port;
-            break;
-        }
-        default:
-            break;
-    }
-    char *ret = malloc(ip_len + 10);
-    sprintf(ret, "[%s]:%d", s, ntohs(port));
-    return ret;
-}
-
 ip_addr_itf_t *get_addrs(int family){
     ip_addr_itf_t *ret = malloc(sizeof(ip_addr_itf_t));
     memset(ret, 0, sizeof(ip_addr_itf_t));
@@ -249,14 +216,6 @@ static void debug_log(const char *line, void *argp) {
     fprintf(stderr, "%s\n", line);
 }
 
-static void print_path(const char *msg, struct sockaddr *local, struct sockaddr *peer) {
-    char *ip_local = ip2str(local);
-    char *ip_peer = ip2str(peer);
-    fprintf(stderr, "Path %s -> %s: %s\n", ip_local, ip_peer, msg);
-    free(ip_local);
-    free(ip_peer);
-}
-
 static void handle_path_events(struct conn_io *conn){
     quiche_path_event *e;
 
@@ -265,25 +224,34 @@ static void handle_path_events(struct conn_io *conn){
     struct sockaddr_storage peer;
     socklen_t peer_len = sizeof(peer);
 
-    while ((e = quiche_conn_path_event_next(conn->conn))){
+    while (1){
+        e = quiche_conn_path_event_next(conn->conn);
+        if (e == NULL)
+            break;
         enum quiche_path_event_type type = quiche_path_event_type(e);
         switch (type)
         {
             case QUICHE_PATH_EVENT_NEW:
-                fprintf(stderr, "new path");
+                quiche_path_event_new(e, &local, &local_len, &peer, &peer_len);
+                print_path("new path", (struct sockaddr *) &local, (struct sockaddr *) &peer);
+                break;
             case QUICHE_PATH_EVENT_VALIDATED:
-                fprintf(stderr, "path validated");
+                quiche_path_event_validated(e, &local, &local_len, &peer, &peer_len);
+                print_path("path validated", (struct sockaddr *) &local, (struct sockaddr *) &peer);
                 break;
             case QUICHE_PATH_EVENT_FAILED_VALIDATION:
-                fprintf(stderr, "path failed validation");
+                quiche_path_event_failed_validation(e, &local, &local_len, &peer, &peer_len);
+                print_path("path failed validation", (struct sockaddr *) &local, (struct sockaddr *) &peer);
                 break;
             case QUICHE_PATH_EVENT_CLOSED:
-                fprintf(stderr, "path closed");
+                quiche_path_event_closed(e, &local, &local_len, &peer, &peer_len);
+                print_path("path closed", (struct sockaddr *) &local, (struct sockaddr *) &peer);
                 break;
             case QUICHE_PATH_EVENT_REUSED_SOURCE_CONNECTION_ID:
                 fprintf(stderr, "reused connection id");
                 break;
             default:
+                fprintf(stderr, "path default");
                 break;
         }
     }
@@ -302,7 +270,6 @@ static void probe_paths(struct conn_io *conn){
         {
             print_path("probing", local, peer);
             int s = quiche_conn_probe_path(conn->conn, local, local_len, peer, peer_len, &seq);
-            fprintf(stderr, "Return of probe %d\n", s);
         }
     }
     
@@ -435,6 +402,9 @@ static void recv_cb(EV_P_ ev_io *w, int revents) {
 
     socket_state_t *sock_state = w->data;
     struct conn_io *conn_io = sock_state->conn;
+    int socket = conn_io->sockets[sock_state->idx];
+
+    fprintf(stderr, "Received data on %s\n", ip2str((struct sockaddr *) &conn_io->local_addr[sock_state->idx]));
 
     static uint8_t buf[65535];
 
@@ -443,7 +413,7 @@ static void recv_cb(EV_P_ ev_io *w, int revents) {
         socklen_t peer_addr_len = sizeof(peer_addr);
         memset(&peer_addr, 0, peer_addr_len);
 
-        ssize_t read = recvfrom(conn_io->sockets[sock_state->idx], buf, sizeof(buf), 0,
+        ssize_t read = recvfrom(socket, buf, sizeof(buf), 0,
                                 (struct sockaddr *) &peer_addr,
                                 &peer_addr_len);
 
@@ -720,12 +690,12 @@ int get_sockets(int family, int number_sockets, struct conn_io *conn_io){
             struct sockaddr_in *addr_in = (struct sockaddr_in *) &addr;
             addr_in->sin_family = AF_INET;
             addr_in->sin_addr.s_addr = INADDR_ANY;
-            addr_in->sin_port=htons(9000 + i);
+            addr_in->sin_port=htons(8080 + i);
         }else{
             struct sockaddr_in6 *addr_in6 = (struct sockaddr_in6 *) &addr;
             addr_in6->sin6_family = AF_INET6;
             addr_in6->sin6_addr = in6addr_any;
-            addr_in6->sin6_port=htons(9000 + i);
+            addr_in6->sin6_port=htons(8080 + i);
         }
 
 
@@ -785,7 +755,7 @@ http_response_t *quiche_fetch(const char *host, const char *port, const char *pa
     quiche_config_set_initial_max_stream_data_uni(config, 1000000);
     quiche_config_set_initial_max_streams_bidi(config, 100);
     quiche_config_set_initial_max_streams_uni(config, 100);
-    quiche_config_set_active_connection_id_limit(config, 10);
+    quiche_config_set_active_connection_id_limit(config, 5);
 
     //quiche_config_set_disable_active_migration(config, true);
 

@@ -6,3 +6,6 @@ out.html
 client
 server
 log
+*.o
+server.out
+client.out

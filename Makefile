@@ -1,13 +1,16 @@
 INCLUDES=-Iquiche/quiche/include -I/usr/local/include -Iuthash/include
 LIBS=quiche/target/release/libquiche.a -lev -ldl -pthread -lm
 
-all: client server
+all: dependencies client server
 
-server: quiche-server.c dependencies
-	gcc -o server $< $(LIBS) $(INCLUDES) -g
+server: quiche-server.o utils.o dependencies
+	gcc -o server $(shell echo $^ | sed -e 's/dependencies//g') $(LIBS) $(INCLUDES) -g
 
-client: quiche-client.c dependencies
-	gcc -o client $< $(LIBS) $(INCLUDES) -g
+client: quiche-client.o utils.o dependencies
+	gcc -o client $(shell echo $^ | sed -e 's/dependencies//g') $(LIBS) $(INCLUDES) -g
+
+%.o: %.c
+	gcc -c $< $(INCLUDES) -g
 
 dependencies: quiche libev uthash
 
@@ -37,3 +40,4 @@ uthash:
 clean:
 	rm client
 	rm server
+	rm *.o

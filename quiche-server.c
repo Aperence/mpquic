@@ -23,6 +23,7 @@
 // LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
 // NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 // SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+#include "utils.h"
 
 #include <inttypes.h>
 #include <stdio.h>
@@ -55,10 +56,20 @@
 struct connections {
     int sock;
 
-    struct sockaddr *local_addr;
+    struct sockaddr_storage local_addr;
     socklen_t local_addr_len;
 
     struct conn_io *h;
+};
+
+struct connection_ids_state {
+    uint8_t cid[LOCAL_CONN_ID_LEN];
+    int id;
+    UT_hash_handle hh;
+};
+
+struct connection_ids{
+    struct connection_ids_state *h;
 };
 
 typedef struct schedule_state{
@@ -70,14 +81,10 @@ struct conn_io {
     ev_timer timer;
 
     int sock;
-
-    uint8_t cid[LOCAL_CONN_ID_LEN];
+    int id;
 
     quiche_conn *conn;
     quiche_h3_conn *http3;
-
-    struct sockaddr_storage local_addr;
-    socklen_t local_addr_len;
 
     struct sockaddr_storage peer_addr;
     socklen_t peer_addr_len;
@@ -89,11 +96,14 @@ struct conn_io {
     schedule_state_t schedule_data;
 };
 
+static int id = 0;
+
 static quiche_config *config = NULL;
 
 static quiche_h3_config *http3_config = NULL;
 
 static struct connections *conns = NULL;
+static struct connection_ids *conns_id = NULL;
 
 static void timeout_cb(EV_P_ ev_timer *w, int revents);
 
@@ -115,21 +125,24 @@ static void handle_path_events(struct conn_io *conn){
         switch (type)
         {
             case QUICHE_PATH_EVENT_NEW:
-                fprintf(stderr, "new path");
                 quiche_path_event_new(e, &local, &local_len, &peer, &peer_len);
+                print_path("new path", (struct sockaddr *) &local, (struct sockaddr *) &peer);
                 quiche_conn_probe_path(conn->conn, (struct sockaddr *) &local, 
                                        local_len, (struct sockaddr *) &peer, 
                                        peer_len, &seq);
                 break;
             case QUICHE_PATH_EVENT_VALIDATED:
-                fprintf(stderr, "path validated");
+                quiche_path_event_validated(e, &local, &local_len, &peer, &peer_len);
+                print_path("path validated", (struct sockaddr *) &local, (struct sockaddr *) &peer);
                 conn->schedule_data.number_paths++;
                 break;
             case QUICHE_PATH_EVENT_FAILED_VALIDATION:
-                fprintf(stderr, "path failed validation");
+                quiche_path_event_failed_validation(e, &local, &local_len, &peer, &peer_len);
+                print_path("path failed validation", (struct sockaddr *) &local, (struct sockaddr *) &peer);
                 break;
             case QUICHE_PATH_EVENT_CLOSED:
-                fprintf(stderr, "path closed");
+                quiche_path_event_closed(e, &local, &local_len, &peer, &peer_len);
+                print_path("path closed", (struct sockaddr *) &local, (struct sockaddr *) &peer);
                 break;
             case QUICHE_PATH_EVENT_REUSED_SOURCE_CONNECTION_ID:
                 fprintf(stderr, "reused connection id");
@@ -160,6 +173,11 @@ static int provide_cids(struct conn_io *conn){
             return -4;
         
         quiche_conn_new_scid(conn->conn, scid, LOCAL_CONN_ID_LEN, reset, false, &seq);
+
+        struct connection_ids_state *st = malloc(sizeof(struct connection_ids_state));
+        memcpy(st->cid, scid, LOCAL_CONN_ID_LEN);
+        st->id = conn->id;
+        HASH_ADD(hh, conns_id->h, cid, LOCAL_CONN_ID_LEN, st);
     }
     
     close(rng);
@@ -171,15 +189,16 @@ static void schedule(struct conn_io *conn){
     int offset = conn->schedule_data.idx;
     struct sockaddr_storage peer;
     socklen_t peer_len;
-    quiche_socket_addr_iter *iter = quiche_conn_paths_iter(conn->conn, (struct sockaddr *) &conn->local_addr, conn->local_addr_len);
-    for (size_t i = 0; i < offset; i++){
+    quiche_socket_addr_iter *iter = quiche_conn_paths_iter(conn->conn, (struct sockaddr *) &conns->local_addr, conns->local_addr_len);
+    for (size_t i = 0; i < offset + 1; i++){
         quiche_socket_addr_iter_next(iter, &peer, (size_t *) &peer_len);
     }
     quiche_socket_addr_iter_free(iter);
-    conn->schedule_data.idx = (conn->schedule_data.idx + 1) % conn->schedule_data.number_paths;
+    conn->schedule_data.idx = (offset+ 1) % conn->schedule_data.number_paths;
     quiche_conn_migrate(conn->conn, 
-                        (struct sockaddr *) &conn->local_addr, conn->local_addr_len,
+                        (struct sockaddr *) &conns->local_addr, conns->local_addr_len,
                         (struct sockaddr *) &peer, peer_len, &seq);
+    print_path("migrating", (struct sockaddr *) &conns->local_addr, (struct sockaddr *) &peer);
 }
 
 static void flush_egress(struct ev_loop *loop, struct conn_io *conn_io) {
@@ -201,9 +220,11 @@ static void flush_egress(struct ev_loop *loop, struct conn_io *conn_io) {
             return;
         }
 
+        print_path("sending data", (struct sockaddr *) &send_info.from, (struct sockaddr *) &send_info.to);
+
         ssize_t sent = sendto(conn_io->sock, out, written, 0,
-                              (struct sockaddr *) &conn_io->peer_addr,
-                              conn_io->peer_addr_len);
+                              (struct sockaddr *) &send_info.to,
+                              send_info.to_len);
         if (sent != written) {
             perror("failed to send");
             return;
@@ -288,9 +309,7 @@ static struct conn_io *create_conn(uint8_t *scid, size_t scid_len,
         fprintf(stderr, "failed, scid length too short\n");
     }
 
-    memcpy(conn_io->cid, scid, LOCAL_CONN_ID_LEN);
-
-    quiche_conn *conn = quiche_accept(conn_io->cid, LOCAL_CONN_ID_LEN,
+    quiche_conn *conn = quiche_accept(scid, LOCAL_CONN_ID_LEN,
                                       odcid, odcid_len,
                                       local_addr,
                                       local_addr_len,
@@ -306,9 +325,6 @@ static struct conn_io *create_conn(uint8_t *scid, size_t scid_len,
     conn_io->sock = conns->sock;
     conn_io->conn = conn;
 
-    memcpy(&conn_io->local_addr, local_addr, local_addr_len);
-    conn_io->local_addr_len = local_addr_len;
-
     memcpy(&conn_io->peer_addr, peer_addr, peer_addr_len);
     conn_io->peer_addr_len = peer_addr_len;
 
@@ -318,8 +334,16 @@ static struct conn_io *create_conn(uint8_t *scid, size_t scid_len,
     conn_io->file = -1;
     conn_io->schedule_data.idx = 0;
     conn_io->schedule_data.number_paths = 1;
+    conn_io->id = id;
+    
+    struct connection_ids_state *st = malloc(sizeof(struct connection_ids_state));
+    memcpy(st->cid, scid, LOCAL_CONN_ID_LEN);
+    st->id = id;
 
-    HASH_ADD(hh, conns->h, cid, LOCAL_CONN_ID_LEN, conn_io);
+    id++;
+
+    HASH_ADD(hh, conns_id->h, cid, LOCAL_CONN_ID_LEN, st);
+    HASH_ADD(hh, conns->h, id, sizeof(int), conn_io);
 
     fprintf(stderr, "new connection\n");
 
@@ -346,6 +370,7 @@ static int for_each_header(uint8_t *name, size_t name_len,
 
 static void recv_cb(EV_P_ ev_io *w, int revents) {
     struct conn_io *tmp, *conn_io = NULL;
+    struct connection_ids_state *st_tmp, *st = NULL;
 
     static uint8_t buf[65535];
     static uint8_t file_buf[65535];
@@ -393,8 +418,11 @@ static void recv_cb(EV_P_ ev_io *w, int revents) {
             return;
         }
 
-        HASH_FIND(hh, conns->h, dcid, dcid_len, conn_io);
-
+        HASH_FIND(hh, conns_id->h, dcid, dcid_len, st);
+        if (st){
+            HASH_FIND(hh, conns->h, &st->id, sizeof(int), conn_io);
+        }
+            
         if (conn_io == NULL) {
             if (!quiche_version_is_supported(version)) {
                 fprintf(stderr, "version negotiation\n");
@@ -465,7 +493,7 @@ static void recv_cb(EV_P_ ev_io *w, int revents) {
             }
 
             conn_io = create_conn(dcid, dcid_len, odcid, odcid_len,
-                                  conns->local_addr, conns->local_addr_len,
+                                  (struct sockaddr *) &conns->local_addr, conns->local_addr_len,
                                   &peer_addr, peer_addr_len);
 
             if (conn_io == NULL) {
@@ -477,9 +505,11 @@ static void recv_cb(EV_P_ ev_io *w, int revents) {
             (struct sockaddr *)&peer_addr,
             peer_addr_len,
 
-            conns->local_addr,
+            (struct sockaddr *) &conns->local_addr,
             conns->local_addr_len,
         };
+
+        print_path("received", (struct sockaddr *) &conns->local_addr, (struct sockaddr *) &peer_addr);
 
         ssize_t done = quiche_conn_recv(conn_io->conn, buf, readed, &recv_info);
 
@@ -504,13 +534,6 @@ static void recv_cb(EV_P_ ev_io *w, int revents) {
                     fprintf(stderr, "failed to create HTTP/3 connection\n");
                     continue;
                 }
-            }
-
-            if (conn_io->file >= 0){
-                
-                int size = read(conn_io->file, file_buf, 65535);
-                quiche_h3_send_body(conn_io->http3, conn_io->conn,
-                                                    conn_io->stream, file_buf, size, size == 0);
             }
 
             while (1) {
@@ -624,6 +647,13 @@ static void recv_cb(EV_P_ ev_io *w, int revents) {
     }
 
     HASH_ITER(hh, conns->h, conn_io, tmp) {
+        if (conn_io->file >= 0){
+            int size = read(conn_io->file, file_buf, 65535);
+            quiche_h3_send_body(conn_io->http3, conn_io->conn,
+                                conn_io->stream, file_buf, size, size == 0);
+        }
+
+        schedule(conn_io);
         flush_egress(loop, conn_io);
 
         if (quiche_conn_is_closed(conn_io->conn)) {
@@ -642,6 +672,13 @@ static void recv_cb(EV_P_ ev_io *w, int revents) {
 
             quiche_conn_free(conn_io->conn);
             free(conn_io);
+        }
+    }
+
+    HASH_ITER(hh, conns_id->h, st, st_tmp) {
+        HASH_FIND(hh, conns->h, &st->id, sizeof(int), tmp);
+        if (!tmp){
+            HASH_DELETE(hh, conns_id->h, st);
         }
     }
 }
@@ -732,7 +769,7 @@ int main(int argc, char *argv[]) {
     quiche_config_set_initial_max_streams_uni(config, 100);
     // quiche_config_set_disable_active_migration(config, true);
     quiche_config_set_cc_algorithm(config, QUICHE_CC_RENO);
-    quiche_config_set_active_connection_id_limit(config, 10);
+    quiche_config_set_active_connection_id_limit(config, 5);
 
     http3_config = quiche_h3_config_new();
     if (http3_config == NULL) {
@@ -743,10 +780,14 @@ int main(int argc, char *argv[]) {
     struct connections c;
     c.sock = sock;
     c.h = NULL;
-    c.local_addr = local->ai_addr;
+    memcpy(&c.local_addr, local->ai_addr, local->ai_addrlen);
     c.local_addr_len = local->ai_addrlen;
 
+    struct connection_ids c_id;
+    c_id.h = NULL;
+
     conns = &c;
+    conns_id = &c_id;
 
     ev_io watcher;
 
